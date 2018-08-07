@@ -1,0 +1,109 @@
+Host：BLE设备
+User：手机
+③ Pairing-Verify Phase(建立安全会话层)
+1. Host端Session初始化，生成Host_Session DH Public/Secret Key（session_keys.verify.public/session_keys.verify.secret）
+User —> Host(客户向主机写): PAIRING_EVENT_VERIFY_WRITE: PAIRING_TAG_STATE
+    // Host端生成Curve25519 DH key密钥对
+    random_create(session_keys.verify.secret, sizeof(session_keys.verify.secret));
+    #define crypto_scalarmult_base  crypto_scalarmult_curve25519_base
+    crypto_scalarmult_base(session_keys.verify.public, session_keys.verify.secret);
+
+2. Host端接收User_Session DH Public Key，计算Session DHKey
+User —> Host(客户向主机写): PAIRING_EVENT_VERIFY_WRITE: PAIRING_TAG_PUBLICKEY
+    // 与前一阶段User端发送client/ltpk不同，这里User端不加密直接发送User_Session DH Public Key
+    memcpy(session_keys.client.public, value, sizeof(session_keys.client.public));
+    // Host_secret_key + User_Public_key Curver25519获得session_keys.shared密钥
+    crypto_scalarmult(session_keys.shared, session_keys.verify.secret, session_keys.client.public);
+
+3. Host端安全发送Host_Session DH Public key给User端的方法
+Host —> User(客户从主机读): PAIRING_EVENT_VERIFY_READ: case 1:
+  ● 使用Host的签名私钥crypto_keys.sign.secret对包含session_keys.verify.public的信息进行ed25519签名
+    uint8_t smessage[64 + sizeof(session_keys.verify.public) + sizeof(pairing_device_name) + sizeof(session_keys.client.public)];
+    memcpy(smessage + 64, session_keys.verify.public, sizeof(session_keys.verify.public));
+    memcpy(smessage + 64 + sizeof(session_keys.verify.public), pairing_device_name, sizeof(pairing_device_name));
+    memcpy(smessage + 64 + sizeof(session_keys.verify.public) + sizeof(pairing_device_name), session_keys.client.public, sizeof(session_keys.client.public));
+    uint64_t slen = 0;
+    // 使用Pairing-Setup Phase生成的crypto_keys.sign.secret签名，User端会使用Pairing-Setup Phase获得的crypto_keys.sign.public验证签名
+    crypto_sign(smessage, &slen, smessage + 64, sizeof(smessage) - 64, crypto_keys.sign.secret);
+    对2+3+4使用Host签名私钥crypto_keys.sign.secret进行ed25519签名，结果(signature)放入1，得到如下smessage：
+       Content                               Length
+    1. signature                             64B
+    2. session_keys.verify.public            32B(Host端Session DH public Key)
+    3. pairing_device_name                   36B
+    4. session_keys.client.public            32B(User端Session DHKey session_keys.client.public)
+    // 重新排列数据内容
+    uint8_t buffer[2 + sizeof(pairing_device_name) + 2 + 64 + 16];
+    uint8_t* pbuffer = buffer;
+    uint16_t lbuffer = sizeof(buffer);
+    tlv_encode_next(&pbuffer, &lbuffer, PAIRING_MSG_CLIENTNAME, sizeof(pairing_device_name), pairing_device_name);
+    tlv_encode_next(&pbuffer, &lbuffer, PAIRING_MSG_SIGNATURE, 64, smessage);
+       Content                               Length
+    1. PAIRING_MSG_CLIENTNAME                1B
+       sizeof(pairing_device_name)           1B
+       pairing_device_name                   sizeof(pairing_device_name)
+    2. PAIRING_MSG_SIGNATURE                 1B
+       64                                    1B
+       signature                             64B
+
+  ● 使用生成的Session DHkey对签名加密，然后发送
+    // 对生成的Session DHkey session_keys.shared进行hkdf扩展，生成Pairing-Verify阶段使用的pve key(Pair-Verify-Encrypt Key)
+    crypto_hkdf(session_keys.pve, "Pair-Verify-Encrypt-Salt", 24, "Pair-Verify-Encrypt-Info\001", 25, session_keys.shared, sizeof(session_keys.shared));
+    // 使用session_keys.pve进行chacha20_poly1305加密
+    crypto_encryptAndSeal(session_keys.pve, "PV-Msg02", buffer, sizeof(buffer) - 16, buffer, buffer + sizeof(buffer) - 16);
+    // nonce: "PV-Msg02"
+    // 信息发送
+    tlv_encode_next(&data, rlength, PAIRING_TAG_STATE, sizeof(pairing_state), &pairing_state);
+    tlv_encode_next(&data, rlength, PAIRING_TAG_MSG, sizeof(buffer), buffer);
+    // 与前一阶段Host端发送Hostname/Sign_PublicKey不同，这里Host端不加密直接发送DH Public Key
+    tlv_encode_next(&data, rlength, PAIRING_TAGPUBLICKEY, sizeof(session_keys.verify.public), session_keys.verify.public);
+  
+4. Host端安全确认收到的User Session DH Public key的方法
+User —> Host(客户向主机写): PAIRING_EVENT_VERIFY_WRITE: PAIRING_TAG_MSG
+  ● 使用与上面一样的的session_keys.pve，解密验证User发来的信息
+    crypto_verifyAndDecrypt(session_keys.pve, "PV-Msg03", value, length - 16, value, value + length - 16)
+    // nonce: "PV-Msg03"
+    解密后得到以下内容  
+       Content                               Length
+    1. PAIRING_MSG_CLIENTNAME                1B
+       sizeof(client)                        1B
+       client                                36B
+    2. PAIRING_MSG_SIGNATURE                 1B
+       64                                    1B
+       signature                             64B
+
+  ● 使用User的签名公钥Client.ltpk对包含session_keys.client.public的内容进行ed25519签名验证，确保正确性
+    // 重新排列数据内容
+    uint8_t message[64 + sizeof(session_keys.client.public) + 36 + sizeof(session_keys.verify.public)];
+    memcpy(message, signature, 64);
+    memcpy(message + 64, session_keys.client.public, sizeof(session_keys.client.public));
+    memcpy(message + 64 + sizeof(session_keys.client.public), client, 36);
+    memcpy(message + 64 + sizeof(session_keys.client.public) + 36, session_keys.verify.public, sizeof(session_keys.verify.public));
+       Content                               Length
+    1. signature                             64B
+    2. session_keys.client.public            32B(Client端Session DH public Key)
+    3. client                                36B
+    4. session_keys.verify.public            32B(Host端Session DHKey session_keys.verify.public)    
+    // 使用的是前一阶段获得的Client.ltpk进行签名验证 
+    crypto_sign_open(result, &rlen, message, sizeof(message), crypto_keys.client.ltpk)
+本阶段用于双方确认正确获得对方Session DH Public Key，建立Session DHKey过程
+
+④ Pairing-Pairings-Phase(Session数据传输)
+User —> Host(客户向主机写): PAIRING_EVENT_PAIRINGS_WRITE
+Host —> User(客户从主机读): PAIRING_EVENT_PAIRINGS_READ
+    // 生成Session数据传输密钥
+    uint8_t key[64];
+    // 对生成DHKey session_keys.shared进行hkdf扩展，生成Session Read Key
+    crypto_hkdf(key, "Control-Salt", 12, "Control-Read-Encryption-Key\001", 28, session_keys.shared, sizeof(session_keys.shared));
+    // 仅copy了前32个字节作为chacha20_poly1305密钥
+    memcpy(session_keys.transport.read, key, 32);
+    // 对生成DHKey session_keys.shared进行hkdf扩展，生成Session Write Key
+    crypto_hkdf(key, "Control-Salt", 12, "Control-Write-Encryption-Key\001", 29, session_keys.shared, sizeof(session_keys.shared));
+    // 仅copy了前32个字节作为chacha20_poly1305密钥
+    memcpy(session_keys.transport.write, key, 32);
+    // 初始化nonce
+    memset(session_keys.transport.read_nonce, 0, sizeof(session_keys.transport.read_nonce));
+    memset(session_keys.transport.write_nonce, 0, sizeof(session_keys.transport.write_nonce));
+加密数据：crypto_transportEncrypt(session_keys.transport.read, session_keys.transport.read_nonce, plaintext, length, ciphertext, clength);
+解密数据：crypto_transportDecrypt(session_keys.transport.write, session_keys.transport.write_nonce, ciphertext, length, plaintext, plength)
+
+
