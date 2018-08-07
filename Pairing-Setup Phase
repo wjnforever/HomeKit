@@ -1,0 +1,277 @@
+① 基本操作
+提供两类通用加密算法库
+#define USE_UNACL_SCALARMULT      1      
+#define USE_TWEETNACL_SCALARMULT  1    //NaCL in 100 Tweets: http://tweetnacl.cr.yp.to/software.html
+目前使用的是TWEETNACL(NACL作为一个无脑库，兄弟，可以，很方便，不跟你多bb)
+1. 函数说明
+  ● 随机数
+设备平台提供随机数生成函数random_create
+  ● H(sha512)
+crypto_hash_sha512
+  ● Bignum库
+Multi-precision integer library(part of mbed TLS)
+  ● Hkdf扩展(sha512hmac)
+crypto_hkdf(uint8_t* target, uint8_t* salt, uint8_t salt_length, uint8_t* info, uint8_t info_length, uint8_t* ikm, uint8_t ikm_length)
+  ● DH公钥签名/验证(ed25519)
+crypto_sign_ed25519_keypair(u8 *pk, u8 *sk)
+crypto_sign_ed25519(u8 *sm,u64 *smlen,const u8 *m,u64 n,const u8 *sk)
+crypto_sign_ed25519_open(u8 *m,u64 *mlen,const u8 *sm,u64 n,const u8 *pk)
+  ● 信息加密(chacha20_poly1305)
+       crypto_verifyAndDecrypt(const uint8_t* key, uint8_t* nonce, uint8_t* encrypted, uint8_t length, uint8_t* output_buf, uint8_t* mac)
+       crypto_encryptAndSeal(const uint8_t* key, uint8_t* nonce, uint8_t* plain, uint16_t length, uint8_t* output_buf, uint8_t* output_mac)
+crypto_stream_chacha20_xor(u8 *c,const u8 *m,u64 b,const u8 *n,const u8 *k,const u8 v)
+
+2. 密钥说明
+  ● Host/User ED25519密钥
+       // Host端ED25519签名密钥对: Host使用secret[64]对Host端Session DH public Key签名，User使用public[32]验证签名
+       typedef struct
+       {
+       struct
+       {
+         // Public key is the last 32-bytes of the secret key
+         union
+         {
+           uint8_t secret[64];    //
+           struct
+           {
+             uint8_t __ignore__[32];
+             uint8_t public[32];
+           };
+         };
+       } sign;
+       // User端ED25519公钥：User使用自己的签名密钥对User端Session DH public Key签名，Host使用ltpk[32]验证签名
+       // Client we are paired with
+       struct
+       {
+         uint8_t name[36];
+         uint8_t ltpk[32];
+       } client;
+     } crypto_keys_t;
+
+  ● Session Phase Key
+     typedef struct
+     {
+       // Pairing-Verify(建立安全会话层)阶段，对Session DHKey(shared[32])进行hkdf扩展，用于加解密的key
+       uint8_t     pve[64];
+ 
+       // Pairing-Verify(建立安全会话层)阶段，Host_secret_key(verify.secret[32]) + User_Public_key(client.public[32]) Curver25519生成的当前Session DHKey
+       // Shared secret established between client and accessory
+       uint8_t     shared[32];
+
+       // Keys and nonces used during encrypted comms
+       struct
+       {
+         // Pairing-Pairing(Session内数据传输)阶段，对生成DHKey session_keys.shared进行hkdf扩展，用于chacha20_poly1305加密
+         uint8_t   read[32];
+         uint8_t   write[32];
+         // Pairing-Pairing(Session内数据传输)阶段，chacha20_poly1305流加密使用的nonce，按数据index增加
+         uint8_t   read_nonce[8];
+         uint8_t   write_nonce[8];
+       } transport;
+
+       // DH keys
+       // Pairing-Verify(建立安全会话层)阶段，Host端Session DH密钥对
+       struct
+       {
+         uint8_t   secret[32];
+         uint8_t   public[32];
+       } verify;
+
+       // Client keys
+       // Pairing-Verify(建立安全会话层)阶段，User端Session DH Public Key
+       struct
+       {
+         uint8_t   public[32];
+       } client;
+     } session_keys_t;
+
+② SRP：Homekit实现中，BLE设备作为SRP服务器端(Host)，对于BLE协议作为从机；iOS设备作为SRP客户端(User)，对于BLE协议作为主机
+SRP是一个基于口令的身份认证和密钥交换协议。SRP的优点在于，认证过程中不会有密钥明文传递的现象，用户只需要持有口令即可，此外，服务端存储的非用户的口令，而是与口令相关的信息，即便服务器被敌手俘获，敌手也无法伪造一个合法的客户端(无法拿到口令) 从而保证了双方的安全。
+Secure Remote Password使用参数说明
+N       一个非常大的素数(N=2q+1,q是一个素数，所有的运算都是在mod N 上完成) 
+g       mod N上的生成元 ，应该是2个巨大的素数乘得来
+k       k = H(N，G) 乘数因子(SRP-6中，k=3) 
+s       用户的盐值(salt) 
+I       用户名 
+p       明文口令 
+H()     单向hash 
+^       模幂运算 
+u       随机计算值 
+a,b     临时秘密值(Secret ephemeral values) 
+A,B     临时公开值(Public ephemeral values) 
+x       私钥(由p和s生成) 
+v       口令校验值
+
+1. 服务端存储信息
+各元长度：
+typedef struct
+{
+  uint8_t b[32];
+  uint8_t salt[16];
+  uint8_t v[384];   // 384 * 8 = 3072 bit
+  uint8_t B[384];   // 384 * 8 = 3072 bit
+
+  uint8_t K[64];
+  uint8_t M1[64];
+  uint8_t M2[64];
+  ...
+} srp_keys_t;
+服务端(Host)计算用户的信息并保存， 用于验证客户端登陆。 
+1.1 首次连接，Host生成随机用户盐值及临时秘密值b
+    // Generate salt
+    random_create(srp.salt, sizeof(srp.salt));
+    // Generate 'b' - a random value
+    random_create(srp.b, 32);
+
+1.2 Host计算B
+    #define HOMEKIT_CONFIG_PINCODE                          "987-83-082"
+    static const uint8_t pincode[21] = "Pair-Setup:" HOMEKIT_CONFIG_PINCODE;
+    // Calculate 'x' = H(s | H(I | ":" | P))
+    // I(Pairing-Setup用户名)=Pair-Setup
+    // P(明文口令)=HOMEKIT_CONFIG_PINCODE，认证时，User需要主动输入明文口令：HOMEKIT_CONFIG_PINCODE
+    x = H(srp.salt | H("Pair-Setup:" HOMEKIT_CONFIG_PINCODE))  
+    // Calculate 'v' = g ^ x mod N
+    g使用预设值srp_G(=5)，N使用预设值srp_N，应该都是公共商定数值
+    // Calculate 'k'
+    k = H(N，G) = H(srp_N，srp_G)，预设值srp_N_G_hash
+    // Calculate 'B' = k*v + g^b % N
+
+1.3 Host生成ed25519签名密钥对
+    struct
+    {
+      // Public key is the last 32-bytes of the secret key
+      union
+      {
+        uint8_t secret[64];
+        struct
+        {
+          uint8_t __ignore__[32];
+          uint8_t public[32];
+        };
+      };
+    } sign;
+    crypto_sign_keypair(crypto_keys.sign.public, crypto_keys.sign.secret);
+
+2. 认证与协商过程：User扫描附近Host，发起连接，开始Homekit认证流程
+2.1 基础信息交换
+    User —> Host(客户向主机发送): A = g^a (a 是一个随机选取的值，A是公开值)
+    PAIRING_EVENT_SETUP_WRITE: PAIRING_TAG_SRP_A
+  
+    Host —> User(主机向客户发送): s(用户盐值),B = kv + g^b(发送盐值，和公开的B，其中b是一个随机选取的值)
+    PAIRING_EVENT_SETUP_READ: case 1 返回Salt/B
+    tlv_encode_next(&data, rlength, PAIRING_TAG_SALT, 16, srp_getSalt());
+    tlv_encode_next(&data, rlength, PAIRING_TAG_SRP_B, 384, srp_getB());
+
+2.2 身份验证(基于pincode中的Password)
+2.2.1 双方计算：u=H(A,B) 
+    // u = H(A | B)
+2.2.2 User端计算会话密钥
+    // User输入相同明文口令P: HOMEKIT_CONFIG_PINCODE，使用固定I(Pairing-Setup用户名)=Pair-Setup，拼接出相同pincode = I|":"|P
+    // 计算获得与Host端相同的x
+    x = H(s|H(I|":"|P)) = H(srp.salt | H("Pair-Setup:" HOMEKIT_CONFIG_PINCODE))  
+    // Calculate 'v' = g ^ x mod N
+    由于g/N都是预设固定值，因此可计算得到v
+    // 计算会话密钥生成值S
+    S = (B−kg^x)^(a+ux) = (kv+g^b-kg^x)^(a+ux) = (kg^x+g^b-Kg^x)^(a+ux) = (g^b)^(a+ux) 
+    // 用Hash S得出会话密钥K
+    K = H(S) 
+2.2.3 Host端计算会话密钥
+    PAIRING_EVENT_SETUP_WRITE: PAIRING_TAG_SRP_A
+       // 计算会话密钥生成值S
+    // 如果用户输入的口令是对的，根据交换律，那这里算出的S值和客户端算出的S值是一致的 
+    // getS = (A * v^u mod N)^b mod N
+    S = (Av^u)^b = (g^av^u)^b = (g^a*(g^x)^u)^b = (g^(a+ux))^b 
+    // 同样Hash得出会话密钥K
+    K = H(S)
+    // getM1 - username s abuf srp.B K 
+    // g/N预设固定值，因此H(N) xor H(g)为固定值srp_N_hash_srp_G_hash
+    // I(Pairing-Setup用户名)=Pair-Setup
+    // 此处s为用户盐值(与S不同，S为会话密钥生成值)
+    M1 = H(H(N) xor H(g) | H(I) | s | A | B | K)
+    // getM2
+    M2 = H(A | M1 | K)
+
+3. 验证双方生成密钥是否一致
+    User 发送给 Host: M1=H(H(N) xor H(g) | H(I) | s | A | B | K)
+    Host 发送给 User: M2=H(A | M1 | K)
+
+4. 密钥交换及签名验证
+4.1 User端安全发送Clientname/ltpk给Host端的方法
+    PAIRING_EVENT_SETUP_WRITE: PAIRING_TAG_MSG
+  ● Host端使用会话密钥K解密获得User发送的Client/ltpk
+    // 对会话密钥K进行hkdf2扩展到64Bytes
+    crypto_hkdf(output_key, "Pair-Setup-Encrypt-Salt", 23, "Pair-Setup-Encrypt-Info\001", 24, srp_getK(), 64);
+    // 以此密钥output_key对User送达的信息进行chacha20_poly1305(AEAD)解密校验
+    crypto_verifyAndDecrypt(output_key, "PS-Msg05", value, length - 16, value, value + length - 16)
+    //nonce: "PS-Msg05"
+    解密后得到以下内容(与下面Host加密的数据结构相同)
+       Content                               Length
+    1. PAIRING_MSG_CLIENTNAME                1B
+       sizeof(Client)                        1B
+       Client                                36B(强制长度？)
+    2. PAIRING_MSG_LTPK                      1B
+       32                                    1B
+       ltpk                                  32B(User端ed25519 client.sign.public)
+    3. PAIRING_MSG_SIGNATURE                 1B
+       64                                    1B
+       signature                             64B
+
+  ● 使用收到的User端签名公钥ltpk(client.sign.public)进行ed25519签名验证
+    // 重新排列数据内容：Raw Content -> Signature Content
+    uint8_t message[64 + 32 + 36 + 32];
+    memcpy(message, signature, 64);
+    crypto_hkdf(message + 64, "Pair-Setup-Controller-Sign-Salt", 31, "Pair-Setup-Controller-Sign-Info\001", 32, srp_getK(), 64);
+    memcpy(message + 64 + 32, client, 36);
+    memcpy(message + 64 + 32 + 36, ltpk, 32);
+       Content                               Length
+    1. signature                             64B
+    2. hkdf1(srp.K)                          32B
+    3. client                                36B
+    4. ltpk                                  32B
+    // 使用收到的ltpk(client.sign.public)，对上面数据进行ed25519签名验证，是否等同于signature，可确认Client/ltpk正确性(保存为Client.name/Client.ltpk)
+    crypto_sign_open(result, &rlen, message, sizeof(message), ltpk)
+
+4.2  Host端安全发送Hostname/Sign_PublicKey给User端的方法
+    PAIRING_EVENT_SETUP_READ: case 5:
+  ● 使用Host的签名私钥crypto_keys.sign.secret进行ed25519签名
+    #define HOMEKIT_CONFIG_DEVICE_NAME_STRING               "41:42:43:44:45:46"
+    static const uint8_t pairing_device_name[17] = HOMEKIT_CONFIG_DEVICE_NAME_STRING;
+    uint8_t smessage[64 + 32 + sizeof(pairing_device_name) + 32];
+    crypto_hkdf(smessage + 64, "Pair-Setup-Accessory-Sign-Salt", 30, "Pair-Setup-Accessory-Sign-Info\001", 31, srp_getK(), 64);
+    memcpy(smessage + 64 + 32, pairing_device_name, sizeof(pairing_device_name));
+    memcpy(smessage + 64 + 32 + sizeof(pairing_device_name), crypto_keys.sign.public, sizeof(crypto_keys.sign.public));
+    // 使用crypto_keys.sign.secret对smessage进行签名(signature)
+    uint64_t slen = 0;
+    crypto_sign(smessage, &slen, smessage + 64, sizeof(smessage) - 64, crypto_keys.sign.secret);
+    对2+3+4使用Host签名私钥crypto_keys.sign.secret进行ed25519签名，结果(signature)放入1，得到如下smessage：
+       Content                               Length
+    1. signature                             64B
+    2. hkdf1(srp.K)                          32B
+    3. pairing_device_name                   36B
+    4. crypto_keys.sign.public               32B
+
+  ● Host端使用会话密钥K加密数据并发送
+    // 重新排列数据内容：Signature Content -> Raw Content
+    uint8_t buffer[2 + sizeof(pairing_device_name) + 2 + 32 + 2 + 64 + 16];
+    uint8_t* pbuffer = buffer;
+    uint16_t lbuffer = sizeof(buffer);
+    tlv_encode_next(&pbuffer, &lbuffer, PAIRING_MSG_CLIENTNAME, sizeof(pairing_device_name), pairing_device_name);
+    tlv_encode_next(&pbuffer, &lbuffer, PAIRING_MSG_LTPK, 32, crypto_keys.sign.public);
+    tlv_encode_next(&pbuffer, &lbuffer, PAIRING_MSG_SIGNATURE, 64, smessage);
+       Content                               Length
+    1. PAIRING_MSG_CLIENTNAME                1B
+       sizeof(pairing_device_name)           1B
+       pairing_device_name                   sizeof(pairing_device_name)
+    2. PAIRING_MSG_LTPK                      1B
+       32                                    1B
+       crypto_keys.sign.public               32B
+    3. PAIRING_MSG_SIGNATURE                 1B
+       64                                    1B
+       signature                             64B
+    // hkdf2(srp.K)生成一个新的chacha20_poly1305密钥
+    crypto_hkdf(output_key, "Pair-Setup-Encrypt-Salt", 23, "Pair-Setup-Encrypt-Info\001", 24, srp_getK(), 64);
+    // 信息加密发送
+    crypto_encryptAndSeal(output_key, "PS-Msg06", buffer, sizeof(buffer) - 16, buffer, buffer + sizeof(buffer) - 16);
+    //nonce: "PS-Msg06"
+    
+4.3  双方获得的ED25519 Public Key用于建立Session时，对对方发来的DH Public Key的签名认证
